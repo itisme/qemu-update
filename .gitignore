@@ -1,0 +1,4 @@
+*.o
+*.md
+!README.md
+!README_zh.md
