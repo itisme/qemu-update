@@ -387,8 +387,8 @@ static char * get_timestamp(char *buffer, int size) {
     gettimeofday(&tv, NULL);
     struct tm *tm_info = localtime(&tv.tv_sec);
     strftime(buffer, 8, "%H:%M:", tm_info);  // Format only hours and minutes
-    snprintf(buffer + 6, size - 6, "%02d.%03ld", 
-             tm_info->tm_sec, tv.tv_usec / 1000);
+    snprintf(buffer + 6, size - 6, "%02d.%03d",
+             tm_info->tm_sec, (int)(tv.tv_usec / 1000));
     return buffer;
 }
 
