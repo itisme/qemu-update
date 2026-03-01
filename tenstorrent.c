@@ -28,7 +28,7 @@
 #define LOG_LEVEL_DEBUG   3
 
 #ifndef TT_LOG_LEVEL
-#define TT_LOG_LEVEL LOG_LEVEL_VERBOSE
+#define TT_LOG_LEVEL LOG_LEVEL_INFO
 #endif
 
 #define TT_LOG(level, fmt, ...) do { \
