@@ -39,6 +39,7 @@ DECLARE_INSTANCE_CHECKER(TenstorrentState, TENSTORRENT, TYPE_TENSTORRENT)
 #define TLB_2M_WINDOWS_END      (TLB_2M_WINDOW_COUNT * TLB_2M_WINDOW_SIZE)
 
 #define TLB_BASE_INDEX_2M         0
+#define DYNAMIC_TLB_BASE_INDEX    (TLB_BASE_INDEX_2M + 180)
 #define MEM_LARGE_WRITE_TLB       (TLB_BASE_INDEX_2M + 181)
 #define MEM_LARGE_READ_TLB        (TLB_BASE_INDEX_2M + 182)
 #define MEM_SMALL_READ_WRITE_TLB  (TLB_BASE_INDEX_2M + 183)
@@ -69,6 +70,10 @@ DECLARE_INSTANCE_CHECKER(TenstorrentState, TENSTORRENT, TYPE_TENSTORRENT)
 #define NOC1_NOC2AXI_OFFSET 0x10000
 
 #define PCIE_DBI_ADDR 0xF800000000000000ULL
+
+// ARC APB (AXI path) definitions - used when PCIe x=11
+#define ARC_APB_BAR0_START     0x1FF00000
+#define ARC_APB_BAR0_LEN       0x00100000
 
 // CSM space definitions
 #define ARC_CSM_BASE           0x10000000  // CSM space base address
@@ -197,10 +202,20 @@ typedef struct TensixNodeState {
     Rv32Core tensix_cores[NUM_CORES];  // RISCV cores
 } TensixNodeState;
 
+typedef enum {
+    ETH_DM0 = 0,    // Primary ERISC (idle_erisc or active_erisc)
+    ETH_DM1,         // Subordinate ERISC
+    ETH_NUM_CORES,
+} EthCoreType;
+
+typedef struct EthNodeState {
+    Rv32Core cores[ETH_NUM_CORES];   // DM0 + DM1
+    bool dm1_started;                 // Whether DM1 has been started
+} EthNodeState;
+
 typedef union NodeProcessor {
     TensixNodeState tensix;  // Tensix node
-    Rv32Core aeth_core;      // Active Ethernet node
-    Rv32Core ieth_core;      // Idle Ethernet node
+    EthNodeState eth;        // Ethernet node (active or idle)
 } NodeProcessor;
 
 // TLB 2M register structure
@@ -211,7 +226,8 @@ typedef struct TLB_2M_REG {
             uint32_t mid32;
             uint32_t high32;
         };
-        struct {
+        // packed to make y_start straddle mid32 and high32
+        struct __attribute__((packed)) {
             uint64_t address : 43;
             uint64_t x_end : 6;
             uint64_t y_end : 6;
@@ -290,6 +306,12 @@ struct TenstorrentState {
     MemoryRegion tlb_4g_region[TLB_4G_WINDOW_COUNT];
 
     NodeProcessor node_core[BH_GRID_Y][BH_GRID_X];
+
+    // Multicast tracking per TLB: flush source RAM to all targets on config change
+    struct {
+        bool active;
+        int xs, ys, xe, ye;  // logical start/end coords of multicast rectangle
+    } mcast_state[TLB_2M_WINDOW_COUNT];
 
     // Coroutine scheduler
     scheduler_t scheduler;

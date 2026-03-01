@@ -4,15 +4,58 @@
 #define MAJOR_VER 0x01
 #define MINOR_VER 0x00
 
-const uint32_t telemetry_ptr[] = { MAJOR_VER << 16 | MINOR_VER, TELEMETRY_NUM, 0 << 16 | BOARD_ID_HIGH, 1 << 16 | BOARD_ID_LOW, 2 << 16 | VCORE, 
-	3 << 16 | TDP, 4 << 16 | TDC, 5 << 16 | ASIC_TEMPERATURE, 6 << 16 | BOARD_TEMPERATURE, 7 << 16 | AICLK, 8 << 16 | AXICLK,
-	9 << 16 | ARCCLK, 10 << 16 | DDR_STATUS, 11 << 16 | FLASH_BUNDLE_VERSION, 12 << 16 | AICLK_LIMIT_MAX };
-	
-const uint32_t telemetry_data[] = { 0x36 << 4, 0, 844, 60, 0, 64, 64, 1350, 1000, 1000, 0x55555555, 18 << 24 | 9 << 16, 1350 };
+const uint32_t telemetry_ptr[] = {
+	MAJOR_VER << 16 | MINOR_VER, TELEMETRY_NUM,
+	 0 << 16 | BOARD_ID_HIGH,       /*  0 */
+	 1 << 16 | BOARD_ID_LOW,        /*  1 */
+	 2 << 16 | VCORE,               /*  2 */
+	 3 << 16 | TDP,                 /*  3 */
+	 4 << 16 | TDC,                 /*  4 */
+	 5 << 16 | ASIC_TEMPERATURE,    /*  5 */
+	 6 << 16 | BOARD_TEMPERATURE,   /*  6 */
+	 7 << 16 | AICLK,              /*  7 */
+	 8 << 16 | AXICLK,             /*  8 */
+	 9 << 16 | ARCCLK,             /*  9 */
+	10 << 16 | DDR_STATUS,          /* 10 */
+	11 << 16 | FLASH_BUNDLE_VERSION,/* 11 */
+	12 << 16 | AICLK_LIMIT_MAX,    /* 12 */
+	13 << 16 | ENABLED_TENSIX_COL, /* 13 */
+	14 << 16 | ENABLED_ETH,        /* 14 */
+	15 << 16 | ENABLED_GDDR,       /* 15 */
+	16 << 16 | PCIE_USAGE,         /* 16 */
+	17 << 16 | ASIC_ID_HIGH,       /* 17 */
+	18 << 16 | ASIC_ID_LOW,        /* 18 */
+	19 << 16 | ETH_FW_VERSION,     /* 19 */
+	20 << 16 | ASIC_LOCATION,      /* 20 */
+};
+
+const uint32_t telemetry_data[] = {
+	0x36 << 4,          /*  0: BOARD_ID_HIGH */
+	0,                  /*  1: BOARD_ID_LOW */
+	844,                /*  2: VCORE (mV) */
+	60,                 /*  3: TDP (W) */
+	0,                  /*  4: TDC (A) */
+	64,                 /*  5: ASIC_TEMPERATURE */
+	64,                 /*  6: BOARD_TEMPERATURE */
+	1350,               /*  7: AICLK (MHz) */
+	1000,               /*  8: AXICLK (MHz) */
+	1000,               /*  9: ARCCLK (MHz) */
+	0x55555555,         /* 10: DDR_STATUS */
+	18 << 24 | 9 << 16, /* 11: FLASH_BUNDLE_VERSION */
+	1350,               /* 12: AICLK_LIMIT_MAX */
+	0x3FFF,             /* 13: ENABLED_TENSIX_COL (all 14 cols) */
+	0x3FFC,             /* 14: ENABLED_ETH (12/14, harvest 2) */
+	0xFF,               /* 15: ENABLED_GDDR (all 8 banks) */
+	0x1,                /* 16: PCIE_USAGE (pcie0=endpoint) */
+	0x00000001,         /* 17: ASIC_ID_HIGH */
+	0x00000001,         /* 18: ASIC_ID_LOW */
+	18 << 24 | 9 << 16, /* 19: ETH_FW_VERSION */
+	0,                  /* 20: ASIC_LOCATION */
+};
 
 boot_results_t eth_boot_results = {
     .eth_status = {
-        .port_status = PORT_UP
+        .port_status = PORT_DOWN
     }
 };
 

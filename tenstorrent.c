@@ -28,12 +28,14 @@
 #define LOG_LEVEL_DEBUG   3
 
 #ifndef TT_LOG_LEVEL
-#define TT_LOG_LEVEL LOG_LEVEL_INFO
+#define TT_LOG_LEVEL LOG_LEVEL_VERBOSE
 #endif
 
 #define TT_LOG(level, fmt, ...) do { \
     if ((level) <= TT_LOG_LEVEL) printf(fmt, ##__VA_ARGS__); \
 } while (0)
+
+static void proc_arc_msg(TenstorrentState *tt);
 
 static void init_arc_node(TenstorrentState *tt, uint8_t *buf) {
     *(uint32_t *)&buf[ARC_BOOT_STATUS] = 0x5;
@@ -82,6 +84,9 @@ static bool is_arcnode(int x, int y) {
     return x == ARC_X && y == ARC_Y;
 }
 
+// RAM mapping size: 1MB for L1 storage, upper 1MB for MMIO
+#define TLB_RAM_SIZE (1024 * 1024)
+
 static void remap_ram_region(TenstorrentState *tt, int tlb_index, uint8_t *ram, bool isarc){
     MemoryRegion *mr = &tt->tlb_2m_region[tlb_index];
 
@@ -89,17 +94,42 @@ static void remap_ram_region(TenstorrentState *tt, int tlb_index, uint8_t *ram, 
         RAMBlock *rb = mr->ram_block;
         if(rb->host == ram)
             return;
-        if(is_arcram(tt, rb->host))
-            memory_region_del_subregion(mr, &tt->arc_mmio);
+        // Remove arc_mmio if it was attached to any TLB region
+        if(tt->arc_mmio.container)
+            memory_region_del_subregion(tt->arc_mmio.container, &tt->arc_mmio);
         memory_region_del_subregion(&tt->bar0_mmio, mr);
     }
-    
+
     char name[20];
     snprintf(name, sizeof(name), "tlb_mr_%d", tlb_index);
-    memory_region_init_ram_ptr(mr, OBJECT(tt), name, TLB_2M_WINDOW_SIZE, ram);
+    // Only map first 1MB as RAM, upper 1MB is MMIO (handled by tenstorrent_tlb_2m_write)
+    memory_region_init_ram_ptr(mr, OBJECT(tt), name, TLB_RAM_SIZE, ram);
     if(isarc)
         memory_region_add_subregion(mr, ARC_FW_INT_ADDR, &tt->arc_mmio);
     memory_region_add_subregion(&tt->bar0_mmio, tlb_index * TLB_2M_WINDOW_SIZE, mr);
+}
+
+// Flush multicast: copy source node RAM to all other nodes in the rectangle
+static void flush_mcast(TenstorrentState *tt, int tlb_index)
+{
+    int xs = tt->mcast_state[tlb_index].xs;
+    int ys = tt->mcast_state[tlb_index].ys;
+    int xe = tt->mcast_state[tlb_index].xe;
+    int ye = tt->mcast_state[tlb_index].ye;
+    uint8_t *src = obtain_node_mem(tt, xe, ye);
+
+    TT_LOG(LOG_LEVEL_INFO, "flush_mcast tlb=%d (%d,%d)-(%d,%d)\n", tlb_index, xs, ys, xe, ye);
+
+    for (int y = ys; y <= ye; y++) {
+        for (int x = xs; x <= xe; x++) {
+            if (x == xe && y == ye)
+                continue;  // skip source node
+            uint8_t *dst = obtain_node_mem(tt, x, y);
+            if (dst && dst != src)
+                memcpy(dst, src, TLB_2M_WINDOW_SIZE);
+        }
+    }
+    tt->mcast_state[tlb_index].active = false;
 }
 
 // Node ID update function
@@ -108,25 +138,40 @@ static void tenstorrent_update_node_id(TenstorrentState *tt, int tlb_index)
     if (tlb_index < 0 || tlb_index >= TLB_TOTAL_WINDOW_COUNT) {
         return;
     }
-    
+
     bool is_4g_window = (tlb_index >= TLB_2M_WINDOW_COUNT);
     int config_index = is_4g_window ? (tlb_index - TLB_2M_WINDOW_COUNT) : tlb_index;
-    //uint32_t node_id;
-    
+
     if (is_4g_window) {
-        //TLB_4G_REG *config = &tt->tlb_4g_configs[config_index];
-        //node_id = (config->y_end & 0x3F) << 6 | (config->x_end & 0x3F);
+        // 4G window handling (if needed)
     } else {
         TLB_2M_REG *config = &tt->tlb_2m_configs[config_index];
-        //node_id = (config->y_end & 0x3F) << 6 | (config->x_end & 0x3F);
         int x = config->x_end, y = config->y_end;
-        if(tlb_index >= MEM_LARGE_WRITE_TLB && tlb_index <= MEM_SMALL_READ_WRITE_TLB ){
-	    //int mr_index = tlb_index - MEM_LARGE_WRITE_TLB;
-            virt2log(&x, &y);
-	    uint8_t * ram = obtain_node_mem(tt, x, y);
-	    
-	    remap_ram_region(tt, tlb_index, ram, is_arcnode(x, y));
+        virt2log(&x, &y);
+
+        if (config->multicast) {
+            int xs = config->x_start, ys = config->y_start;
+            virt2log(&xs, &ys);
+            // If previous multicast on this TLB had different target, flush first
+            if (tt->mcast_state[tlb_index].active &&
+                (tt->mcast_state[tlb_index].xs != xs || tt->mcast_state[tlb_index].ys != ys ||
+                 tt->mcast_state[tlb_index].xe != x  || tt->mcast_state[tlb_index].ye != y)) {
+                flush_mcast(tt, tlb_index);
+            }
+            tt->mcast_state[tlb_index].active = true;
+            tt->mcast_state[tlb_index].xs = xs;
+            tt->mcast_state[tlb_index].ys = ys;
+            tt->mcast_state[tlb_index].xe = x;
+            tt->mcast_state[tlb_index].ye = y;
+        } else {
+            // Switching from multicast to unicast: flush pending data
+            if (tt->mcast_state[tlb_index].active) {
+                flush_mcast(tt, tlb_index);
+            }
         }
+
+        uint8_t *ram = obtain_node_mem(tt, x, y);
+        remap_ram_region(tt, tlb_index, ram, is_arcnode(x, y));
     }
 }
 
@@ -183,13 +228,17 @@ static void tenstorrent_csm_write(void *opaque, hwaddr addr, uint64_t val,
 
     // Handle specific CSM register writes
     switch (addr) {
+        case ARC_FW_INT_ADDR:
+            // ARC firmware interrupt trigger (new UMD path via ARC APB AXI)
+            proc_arc_msg(tt);
+            break;
         case ARC_MSI_FIFO:
-            // Simulate ARC message processing
+            // Simulate ARC message processing (old UMD path)
             uint32_t res_wptr;
             memcpy(&res_wptr, &tt->csm_regs[0x1114], 4);
             uint32_t new_res_wptr = (res_wptr + 1) % 32;
             memcpy(&tt->csm_regs[0x1114], &new_res_wptr, 4);
-            
+
             // Write success response
             uint32_t response_slot = new_res_wptr % 16;
             uint32_t response_offset = 0x1520 + response_slot * 32;
@@ -387,8 +436,8 @@ static char * get_timestamp(char *buffer, int size) {
     gettimeofday(&tv, NULL);
     struct tm *tm_info = localtime(&tv.tv_sec);
     strftime(buffer, 8, "%H:%M:", tm_info);  // Format only hours and minutes
-    snprintf(buffer + 6, size - 6, "%02d.%03d",
-             tm_info->tm_sec, (int)(tv.tv_usec / 1000));
+    snprintf(buffer + 6, size - 6, "%02d.%03ld", 
+             tm_info->tm_sec, tv.tv_usec / 1000);
     return buffer;
 }
 
@@ -399,12 +448,45 @@ static void flush_mem(Rv32Core * rv32core) {
 
 static void noc_read(void* tt_ptr, void* core_ptr);
 static void noc_write(void* tt_ptr, void* core_ptr);
+static void start_eth_core(TenstorrentState *tt, int x, int y,
+                           Rv32Core *core, uint8_t *ram, uint32_t start_addr,
+                           bool is_primary);
 static void co_yield(void *tt_ptr, void * core_ptr){
     Rv32Core * rv32core = (Rv32Core *)core_ptr;
+    TenstorrentState *tt = (TenstorrentState *)tt_ptr;
+
     if(rv32core->core_type == N_CORE) {
         noc_read(tt_ptr, core_ptr);
         noc_write(tt_ptr, core_ptr);
     }
+
+    // Advance wall clock timer so firmware riscv_wait() can complete.
+    // Firmware reads 0xFFB121F0/F8 → ram[TLB_2M_WINDOW_SIZE + WALL_CLOCK_L/H]
+    {
+        uint32_t *wc_lo = (uint32_t *)&rv32core->ram[TLB_2M_WINDOW_SIZE + WALL_CLOCK_L];
+        uint32_t old = *wc_lo;
+        *wc_lo += INSTRUCTIONS_PER_STEP;
+        if (*wc_lo < old)
+            (*(uint32_t *)&rv32core->ram[TLB_2M_WINDOW_SIZE + WALL_CLOCK_H])++;
+    }
+
+    // ETH DM1 startup detection: when DM0 writes subordinate PC, start DM1
+    // DM0 firmware writes to 0xFFB14008, which rv32-emu maps to ram[mem_size + 0x14008]
+    // mem_size = TLB_2M_WINDOW_SIZE (0x200000), so check ram[0x200000 + 0x14008]
+    if (get_node_type(rv32core->node_x, rv32core->node_y) == ETH) {
+        EthNodeState *eth = &tt->node_core[rv32core->node_y][rv32core->node_x].eth;
+        if (!eth->dm1_started) {
+            uint32_t dm1_pc = *(uint32_t *)&rv32core->ram[TLB_2M_WINDOW_SIZE + SUBORDINATE_IERISC_RESET_PC];
+            if (dm1_pc != 0) {
+                TT_LOG(LOG_LEVEL_INFO, "ETH (%d,%d): starting DM1 at pc=0x%x\n",
+                       rv32core->node_x, rv32core->node_y, dm1_pc);
+                start_eth_core(tt, rv32core->node_x, rv32core->node_y,
+                               &eth->cores[ETH_DM1], rv32core->ram, dm1_pc, false);
+                eth->dm1_started = true;
+            }
+        }
+    }
+
     coroutine_yield_with_handle(rv32core->coroutine_ctx);
 }
 
@@ -532,11 +614,17 @@ static void data_write(TenstorrentState *tt, Rv32Core *rv32core, int noc, int cm
     uint32_t ctrl_off = NOC_CMD_BUF_OFF(noc, cmd_buf, NOC_CMD_CTRL);
     *(uint32_t *)&hi_mem[ctrl_off] = 0;
 
-    uint32_t req_off = NOC_CMD_BUF_OFF(noc, 0, NOC_STATUS(NIU_MST_NONPOSTED_WR_REQ_SENT));
-    (*(uint32_t *)&hi_mem[req_off])++;
+    // Update status registers based on write type
     if (noc_ctrl & NOC_CMD_RESP_MARKED) {
+        // Nonposted write (requires response)
+        uint32_t req_off = NOC_CMD_BUF_OFF(noc, 0, NOC_STATUS(NIU_MST_NONPOSTED_WR_REQ_SENT));
+        (*(uint32_t *)&hi_mem[req_off])++;
         uint32_t ack_off = NOC_CMD_BUF_OFF(noc, 0, NOC_STATUS(NIU_MST_WR_ACK_RECEIVED));
         (*(uint32_t *)&hi_mem[ack_off])++;
+    } else {
+        // Posted write (no response required)
+        uint32_t req_off = NOC_CMD_BUF_OFF(noc, 0, NOC_STATUS(NIU_MST_POSTED_WR_REQ_SENT));
+        (*(uint32_t *)&hi_mem[req_off])++;
     }
     
     uint32_t num_acked = NPST_WRITES_NUM_ACKED - MEM_LOCAL_BASE;
@@ -547,6 +635,14 @@ static void data_write(TenstorrentState *tt, Rv32Core *rv32core, int noc, int cm
 }
 
 static void atom_write(TenstorrentState *tt, Rv32Core *rv32core, int noc, int cmd_buf, uint8_t * lo_mem, uint8_t * hi_mem) {
+    static time_t last_print = 0;
+    time_t now = time(NULL);
+    if (now - last_print >= 3) {
+        char buf[20];
+        TT_LOG(LOG_LEVEL_INFO, "running... (%d,%d) noc %d, time %s\n",
+            rv32core->node_x, rv32core->node_y, noc, get_timestamp(buf, sizeof(buf)));
+        last_print = now;
+    }
     int off = NOC_CMD_BUF_OFF(noc, cmd_buf, NOC_TARG_ADDR_LO);
     uint32_t src_addr = *(uint32_t *)&hi_mem[off];
     off = NOC_CMD_BUF_OFF(noc, cmd_buf, NOC_TARG_ADDR_HI);
@@ -645,7 +741,8 @@ static void noc_write(void* tt_ptr, void* core_ptr) {
     }
 }
 
-static void stop_tensix_node(Rv32Core * tensix_cores) {
+static void stop_tensix_node(int x, int y, Rv32Core * tensix_cores) {
+    TT_LOG(LOG_LEVEL_DEBUG, "stop_tensix_node (%d,%d): stopping\n", x, y);
     for(int i = B_CORE; i < NUM_CORES; ++i) {
         Rv32Core * rv32core = &tensix_cores[i];
         if (rv32core->coroutine_ctx) {
@@ -679,15 +776,13 @@ static void start_tensix_node(TenstorrentState *tt, int x, int y, Rv32Core * ten
     uint8_t *l1_scratchpad = ram;                         // L1 scratchpad (1.5MB)
     uint8_t *high_mem = ram + 0x200000;                   // High mem (6MB, maps to 0xFFB00000+)
 
-    // T0/T1/T2 16KB local memory allocated within high_mem (mapped to 0xFFB00000, 0xFFB18000, etc.)
-    // Each core 16KB = fast LDM (4KB) + slow LDM (8KB) + REGFILE (4KB)
-    // These memory locations are already reserved in high_mem, handled by rv32_emu address translation
-    uint8_t *t0_ldm = high_mem;                          // T0: high_mem + 0 (mapped to 0xFFB00000)
-    uint8_t *t1_ldm = high_mem + 0x1000;                 // T1: high_mem + 4KB
-    uint8_t *t2_ldm = high_mem + 0x2000;                 // T2: high_mem + 8KB
-
     // Initialize Tensix coprocessor
-    tensix_init(tensix_ptr, l1_scratchpad, high_mem, t0_ldm, t1_ldm, t2_ldm);
+    // Each baby core has its own private LDM (ldm[] in Rv32Core), high_mem is shared/public
+    memset(high_mem, 0, HIGH_MEM_SIZE);
+    tensix_init(tensix_ptr, l1_scratchpad, high_mem,
+                tensix_cores[T0_CORE].ldm,
+                tensix_cores[T1_CORE].ldm,
+                tensix_cores[T2_CORE].ldm);
 
     queue_handle_t assigned_queue = NULL;
 
@@ -786,99 +881,121 @@ static void start_tensix_node(TenstorrentState *tt, int x, int y, Rv32Core * ten
 
 static void reset_tensix_node(TenstorrentState *tt, int x, int y, uint64_t val, uint8_t *ram) {
     Rv32Core * tensix_cores = tt->node_core[y][x].tensix.tensix_cores;
-    stop_tensix_node(tensix_cores);
-    if(*(uint32_t *)&ram[(uint64_t)(&((mailboxes_t *)(MEM_MAILBOX_BASE))->go_messages[0].signal)] == RUN_MSG_INIT){
-    	start_tensix_node(tt, x, y, tensix_cores, ram);
-    }
-}
 
-/*
-static void stop_aeth_node(Rv32Core * aeth_core) {
-    if (aeth_core->coroutine_ctx) {
-        rv32_halt(aeth_core->rv32cpu);
-        aeth_core->should_stop = true;
-        
-        usleep(1000);
-        
-        coroutine_destroy(aeth_core->coroutine_ctx);
-        aeth_core->coroutine_ctx = NULL;
-    }
-    
-    if(aeth_core->rv32cpu) {
-        rv32_destroy(aeth_core->rv32cpu);
-        aeth_core->rv32cpu = NULL;
-    }
-}
-*/
-static void stop_aeth_node(Rv32Core * aeth_core) {
-    // Ensure state consistency
-    assert(!(aeth_core->rv32cpu && !aeth_core->coroutine_ctx) && "Inconsistent state: rv32cpu without coroutine_ctx");
-    assert(!(!aeth_core->rv32cpu && aeth_core->coroutine_ctx) && "Inconsistent state: coroutine_ctx without rv32cpu");
-    
-    if (aeth_core->coroutine_ctx) {
-        TT_LOG(LOG_LEVEL_INFO, "Stopping aeth core (%d,%d)\n", aeth_core->node_x, aeth_core->node_y);
-        rv32_halt(aeth_core->rv32cpu);
-        aeth_core->should_stop = true;
-        
-        // Use synchronous destruction
-        coroutine_destroy_sync(aeth_core->coroutine_ctx);
-        aeth_core->coroutine_ctx = NULL;
-        
-        // Immediately destroy rv32cpu
-        if(aeth_core->rv32cpu) {
-            rv32_destroy(aeth_core->rv32cpu);
-            aeth_core->rv32cpu = NULL;
+    // Stop core on any reset write
+    stop_tensix_node(x, y, tensix_cores);
+
+    // Distinguish assert vs deassert by checking the actual RISC reset control
+    // bit (bit 11 = 0x800), NOT bit 31 (staggered_start).  UMD assert_risc_reset
+    // does a read-modify-write that inherits bit 31 from a previous deassert,
+    // so bit 31 alone cannot distinguish the two operations.
+    //   assert  writes 0x47800  (bit11=1, cores held in reset)
+    //   deassert writes 0x80047000 (bit11=0, cores released)
+    //   atexit assert writes 0x80047800 (bit11=1, bit31 inherited — still an assert!)
+    bool is_deassert = (val & 0x800) == 0;
+
+    if(is_deassert) {
+        uint8_t signal = ram[(uint64_t)(&((mailboxes_t *)(MEM_MAILBOX_BASE))->go_messages[0].signal)];
+        uint32_t fw = *(uint32_t *)&ram[MEM_BRISC_FIRMWARE_BASE];
+
+        if(signal == RUN_MSG_INIT && fw != 0) {
+            TT_LOG(LOG_LEVEL_DEBUG, "reset_tensix_node (%d,%d): deassert, starting core (fw=0x%x, signal=0x%x)\n",
+                   x, y, fw, signal);
+            start_tensix_node(tt, x, y, tensix_cores, ram);
         }
-    } else if (aeth_core->rv32cpu) {
-        // If only rv32cpu exists, destroy it directly
-        TT_LOG(LOG_LEVEL_INFO, "Warning: Only rv32cpu exists for aeth core (%d,%d), destroying it\n",
-               aeth_core->node_x, aeth_core->node_y);
-        rv32_destroy(aeth_core->rv32cpu);
-        aeth_core->rv32cpu = NULL;
     }
 }
 
-static void start_aeth_node(TenstorrentState *tt, int x, int y, Rv32Core * aeth_core, uint8_t * ram) {
-    if(aeth_core->rv32cpu)
+static void stop_eth_core(Rv32Core *core) {
+    // Ensure state consistency
+    assert(!(core->rv32cpu && !core->coroutine_ctx) && "Inconsistent state: rv32cpu without coroutine_ctx");
+    assert(!(!core->rv32cpu && core->coroutine_ctx) && "Inconsistent state: coroutine_ctx without rv32cpu");
+
+    if (core->coroutine_ctx) {
+        TT_LOG(LOG_LEVEL_DEBUG, "Stopping eth core (%d,%d)\n", core->node_x, core->node_y);
+        rv32_halt(core->rv32cpu);
+        core->should_stop = true;
+
+        // Use synchronous destruction
+        coroutine_destroy_sync(core->coroutine_ctx);
+        core->coroutine_ctx = NULL;
+
+        // Immediately destroy rv32cpu
+        if(core->rv32cpu) {
+            rv32_destroy(core->rv32cpu);
+            core->rv32cpu = NULL;
+        }
+        core->ram = NULL;
+    } else if (core->rv32cpu) {
+        // If only rv32cpu exists, destroy it directly
+        TT_LOG(LOG_LEVEL_INFO, "Warning: Only rv32cpu exists for eth core (%d,%d), destroying it\n",
+               core->node_x, core->node_y);
+        rv32_destroy(core->rv32cpu);
+        core->rv32cpu = NULL;
+        core->ram = NULL;
+    }
+}
+
+static void stop_eth_node(EthNodeState *eth) {
+    stop_eth_core(&eth->cores[ETH_DM0]);
+    stop_eth_core(&eth->cores[ETH_DM1]);
+    // Clear reset PCs to prevent false trigger on next restart
+    if (eth->cores[ETH_DM0].ram) {
+        // Host writes DM0 PC through TLB → ram[TLB_RAM_SIZE + IERISC_RESET_PC]
+        *(uint32_t *)&eth->cores[ETH_DM0].ram[TLB_RAM_SIZE + IERISC_RESET_PC] = 0;
+        // Firmware writes DM1 PC to 0xFFB14008 → ram[TLB_2M_WINDOW_SIZE + SUBORDINATE_IERISC_RESET_PC]
+        *(uint32_t *)&eth->cores[ETH_DM0].ram[TLB_2M_WINDOW_SIZE + SUBORDINATE_IERISC_RESET_PC] = 0;
+    }
+    eth->dm1_started = false;
+}
+
+static void start_eth_core(TenstorrentState *tt, int x, int y,
+                           Rv32Core *core, uint8_t *ram, uint32_t start_addr,
+                           bool is_primary) {
+    if(core->rv32cpu)
         return;
-        
-    aeth_core->ram = ram;
-    aeth_core->start_addr = MEM_AERISC_FIRMWARE_BASE;
-    aeth_core->core_type = B_CORE;
-    aeth_core->node_x = x;
-    aeth_core->node_y = y;
-    memset(aeth_core->ldm, 0, sizeof(aeth_core->ldm));
-    
-    aeth_core->rv32cpu = rv32_create(ram, NODE_MEM_SIZE - HIGH_MEM_SIZE,
-    	aeth_core->ldm, MEM_BRISC_LOCAL_SIZE, aeth_core->start_addr, INSTRUCTIONS_PER_STEP, NULL, -1);
-    assert(aeth_core->rv32cpu);
-    
-    aeth_core->yield_threshold = STEPS_PER_YIELD;
-    aeth_core->instructions_executed = 0;
-    aeth_core->should_stop = false;
-    aeth_core->wait_init = false;
-    
+
+    core->ram = ram;
+    core->start_addr = start_addr;
+    core->core_type = B_CORE;
+    core->node_x = x;
+    core->node_y = y;
+    memset(core->ldm, 0, sizeof(core->ldm));
+    // Only clear hi-mem for primary core (DM0); DM1 shares ram with DM0
+    if (is_primary) {
+        memset(ram + 0x200000, 0, HIGH_MEM_SIZE);
+    }
+
+    core->rv32cpu = rv32_create(ram, NODE_MEM_SIZE - HIGH_MEM_SIZE,
+    	core->ldm, MEM_BRISC_LOCAL_SIZE, core->start_addr, INSTRUCTIONS_PER_STEP, NULL, -1);
+    assert(core->rv32cpu);
+
+    core->yield_threshold = STEPS_PER_YIELD;
+    core->instructions_executed = 0;
+    core->should_stop = false;
+    core->wait_init = false;
+
     // Create coroutine
-    aeth_core->coroutine_ctx = coroutine_create(rv32_core_coroutine, tt, aeth_core);
-    if (!aeth_core->coroutine_ctx) {
-        fprintf(stderr, "Failed to create coroutine for aeth core (%d,%d)\n", x, y);
-        rv32_destroy(aeth_core->rv32cpu);
-        aeth_core->rv32cpu = NULL;
+    core->coroutine_ctx = coroutine_create(rv32_core_coroutine, tt, core);
+    if (!core->coroutine_ctx) {
+        fprintf(stderr, "Failed to create coroutine for eth core (%d,%d)\n", x, y);
+        rv32_destroy(core->rv32cpu);
+        core->rv32cpu = NULL;
         return;
     }
-    
+
     // Add to scheduler
-    if (!scheduler_add_coroutine(tt->scheduler, aeth_core->coroutine_ctx, NULL)) {
-        fprintf(stderr, "Failed to add coroutine for aeth core (%d,%d) to scheduler\n", x, y);
-        coroutine_destroy(aeth_core->coroutine_ctx);
-        rv32_destroy(aeth_core->rv32cpu);
-        aeth_core->rv32cpu = NULL;
+    if (!scheduler_add_coroutine(tt->scheduler, core->coroutine_ctx, NULL)) {
+        fprintf(stderr, "Failed to add coroutine for eth core (%d,%d) to scheduler\n", x, y);
+        coroutine_destroy(core->coroutine_ctx);
+        rv32_destroy(core->rv32cpu);
+        core->rv32cpu = NULL;
         return;
-    }    
-    
+    }
+
     char buf[20];
-    TT_LOG(LOG_LEVEL_INFO, "start_aeth_node (%d,%d), time %s\n", x, y, get_timestamp(buf, sizeof(buf)));
-    
+    TT_LOG(LOG_LEVEL_DEBUG, "start_eth_core (%d,%d) pc=0x%x, time %s\n", x, y, start_addr, get_timestamp(buf, sizeof(buf)));
+
     tt->total_coroutines++;
 
     // Rebalance after adding a few eth nodes
@@ -891,11 +1008,41 @@ static void start_aeth_node(TenstorrentState *tt, int x, int y, Rv32Core * aeth_
 }
 
 static void reset_eth_node(TenstorrentState *tt, int x, int y, uint64_t val, uint8_t *ram) {
-    Rv32Core * aeth_core = &tt->node_core[y][x].aeth_core;
-    stop_aeth_node(aeth_core);
-    if(*(uint32_t *)&ram[(uint64_t)(&((mailboxes_t *)(MEM_AERISC_MAILBOX_BASE))->go_messages[0].signal)] == RUN_MSG_INIT) {
-    	start_aeth_node(tt, x, y, aeth_core, ram);
+    EthNodeState *eth = &tt->node_core[y][x].eth;
+
+    // Check actual RISC reset bit (bit 11), not staggered_start (bit 31).
+    // See reset_tensix_node comment for rationale.
+    bool is_deassert = (val & 0x800) == 0;
+
+    // Read DM0 PC and signal BEFORE stop_eth_node, because stop_eth_node clears
+    // the reset PC from ram. If the old buffer was reallocated at the same address,
+    // stop_eth_node would wipe the PC the host just wrote.
+    uint32_t dm0_pc = *(uint32_t *)&ram[TLB_RAM_SIZE + IERISC_RESET_PC];
+
+    // Check go_message signal
+    uint64_t signal_offset = (uint64_t)(&((mailboxes_t *)(MEM_AERISC_MAILBOX_BASE))->go_messages[0].signal);
+    uint8_t signal_value = ram[signal_offset];
+
+    // Stop all cores on any reset write
+    stop_eth_node(eth);
+
+    TT_LOG(LOG_LEVEL_DEBUG, "reset_eth_node (%d,%d): val=0x%lx, deassert=%d, dm0_pc=0x%x, signal=0x%x\n",
+           x, y, (unsigned long)val, is_deassert, dm0_pc, signal_value);
+
+    if (!is_deassert) return;
+    if (signal_value != RUN_MSG_INIT) return;
+
+    // If host wrote DM0 PC to ram[IERISC_RESET_PC], use it (new tt-metal).
+    // Otherwise fall back to fixed MEM_AERISC_FIRMWARE_BASE (old tt-metal).
+    if (dm0_pc == 0) {
+        uint32_t fw_first_word = *(uint32_t *)&ram[MEM_AERISC_FIRMWARE_BASE];
+        if (fw_first_word == 0) return;
+        dm0_pc = MEM_AERISC_FIRMWARE_BASE;
     }
+
+    TT_LOG(LOG_LEVEL_DEBUG, "reset_eth_node (%d,%d): starting DM0 at pc=0x%x\n", x, y, dm0_pc);
+    start_eth_core(tt, x, y, &eth->cores[ETH_DM0], ram, dm0_pc, true);
+    eth->dm1_started = false;
 }
 
 static void process_control(TenstorrentState *tt, int x, int y, int offset, uint64_t val, uint8_t *ram) {
@@ -903,7 +1050,6 @@ static void process_control(TenstorrentState *tt, int x, int y, int offset, uint
         if(get_node_type(x, y) == ETH) {
             reset_eth_node(tt, x, y, val, ram);
         } else if(get_node_type(x, y) == TENSIX) {
-            //*(uint32_t *)&ram[(uint64_t)(&((mailboxes_t *)(MEM_MAILBOX_BASE))->go_messages)] = RUN_MSG_DONE;
             reset_tensix_node(tt, x, y, val, ram);
         }
     }
@@ -913,23 +1059,60 @@ static void process_control(TenstorrentState *tt, int x, int y, int offset, uint
 static void tenstorrent_tlb_2m_write(TenstorrentState *tt, hwaddr addr, uint64_t val, unsigned size){
     int tlb_index = addr / TLB_2M_WINDOW_SIZE;
     int offset = addr & TLB_2M_WINDOW_MASK;
-    
+
     if(!tt->tlb_configured[tlb_index])
     	return;
-    
-    TLB_2M_REG *config = &tt->tlb_2m_configs[tlb_index];
-    int y = config->y_end & 0x3F;
-    int x = config->x_end & 0x3F;
-    
-    virt2log(&x, &y);
-    uint8_t *buf = obtain_node_mem(tt, x, y);
-    
-    if(tlb_index != REG_TLB_INDEX)
-        remap_ram_region(tt, tlb_index, buf, is_arcnode(x, y));
-    else
-        process_control(tt, x, y, offset, val, buf);
 
-    memcpy(&buf[offset], &val, size);
+    TLB_2M_REG *config = &tt->tlb_2m_configs[tlb_index];
+
+    if (config->multicast) {
+        int xs = config->x_start, ys = config->y_start;
+        int xe = config->x_end,   ye = config->y_end;
+        virt2log(&xs, &ys);
+        virt2log(&xe, &ye);
+
+        // For soft_reset (process_control), flush first 1MB from RAM-mapped node
+        // to all other nodes first. The RAM region only covers (x_end, y_end), so
+        // firmware/go_message data written through the RAM path must be propagated
+        // before reset_tensix_node checks signal/fw conditions.
+        if (offset >= TLB_RAM_SIZE && tt->mcast_state[tlb_index].active) {
+            flush_mcast(tt, tlb_index);
+            tt->mcast_state[tlb_index].active = true;  // keep active after flush
+        }
+
+        int started_tensix = 0, started_eth = 0;
+        for (int y = ys; y <= ye; y++) {
+            for (int x = xs; x <= xe; x++) {
+                uint8_t *buf = obtain_node_mem(tt, x, y);
+                if (offset >= TLB_RAM_SIZE)
+                    process_control(tt, x, y, offset, val, buf);
+                memcpy(&buf[offset], &val, size);
+                // Count started cores for summary
+                if (offset == (TENSIX_SOFT_RESET_ADDR & TLB_2M_WINDOW_MASK)) {
+                    NodeType nt = get_node_type(x, y);
+                    if (nt == TENSIX && tt->node_core[y][x].tensix.tensix_cores[B_CORE].rv32cpu)
+                        started_tensix++;
+                    else if (nt == ETH && tt->node_core[y][x].eth.cores[ETH_DM0].rv32cpu)
+                        started_eth++;
+                }
+            }
+        }
+        if (started_tensix || started_eth) {
+            bool is_deassert = (val & 0x800) == 0;
+            char buf[20];
+            TT_LOG(LOG_LEVEL_INFO, "mcast soft_reset (%d,%d)-(%d,%d): %s, started %d tensix + %d eth, val=0x%lx, time %s\n",
+                   xs, ys, xe, ye, is_deassert ? "deassert" : "assert",
+                   started_tensix, started_eth, (unsigned long)val, get_timestamp(buf, sizeof(buf)));
+        }
+    } else {
+        int x = config->x_end & 0x3F;
+        int y = config->y_end & 0x3F;
+        virt2log(&x, &y);
+        uint8_t *buf = obtain_node_mem(tt, x, y);
+        if (offset >= TLB_RAM_SIZE)
+            process_control(tt, x, y, offset, val, buf);
+        memcpy(&buf[offset], &val, size);
+    }
 }
 
 // BAR0 operation functions - main MMIO space
@@ -957,7 +1140,7 @@ static uint64_t tenstorrent_bar0_read(void *opaque, hwaddr addr, unsigned size)
         if (offset < NOC2AXI_CFG_SIZE) {
             switch (offset) {
                 case 0x4044:
-                    val = 0x2; // Simulate NOC ID = 2
+                    val = 0xB; // PCIe x=11 (TYPE1/Local), ARC accessible over AXI
                     break;
                 case 0x4100:
                     val = is_noc_translation_enabled() ? 1 << 14 : 0;	// enable coordinate translation, info in tt_metal/hw/inc/blackhole/noc/noc_parameters.h
@@ -974,17 +1157,34 @@ static uint64_t tenstorrent_bar0_read(void *opaque, hwaddr addr, unsigned size)
             }
         }
     }
+    else if (addr >= ARC_APB_BAR0_START && addr < ARC_APB_BAR0_START + ARC_APB_BAR0_LEN) {
+        // ARC APB AXI path - maps to same registers as CSM
+        hwaddr arc_offset = addr - ARC_APB_BAR0_START;
+        val = tenstorrent_csm_read(opaque, arc_offset, size);
+    }
     else if (addr <= TLB_2M_WINDOWS_END) {
         // 2M TLB window access
         return tenstorrent_tlb_2m_read(tt, addr, size);
-    }    
+    }
 
     return val;
 }
 
 static void tenstorrent_bar0_write(void *opaque, hwaddr addr, uint64_t val,
-                                  unsigned size)
+                                   unsigned size)
 {
+    static hwaddr last_addr = 0;
+    static uint64_t last_val = 0;
+    static unsigned last_size = 0;
+    
+    // Skip if same as immediately previous call (KVM MMIO re-execution)
+    if (addr == last_addr && val == last_val && size == last_size) {
+        return;
+    }
+    last_addr = addr;
+    last_val = val;
+    last_size = size;
+    
     TenstorrentState *tt = opaque;
 
     // Handle TLB configuration register writes
@@ -1013,6 +1213,11 @@ static void tenstorrent_bar0_write(void *opaque, hwaddr addr, uint64_t val,
         // TLB-mapped CSM window access - convert to CSM physical address
         hwaddr csm_offset = addr - KERNEL_TLB_START;
         tenstorrent_csm_write(opaque, csm_offset, val, size);
+    }
+    else if (addr >= ARC_APB_BAR0_START && addr < ARC_APB_BAR0_START + ARC_APB_BAR0_LEN) {
+        // ARC APB AXI path - maps to same registers as CSM
+        hwaddr arc_offset = addr - ARC_APB_BAR0_START;
+        tenstorrent_csm_write(opaque, arc_offset, val, size);
     }
     else if(addr <= TLB_2M_WINDOWS_END) {
         return tenstorrent_tlb_2m_write(tt, addr, val, size);
@@ -1067,7 +1272,7 @@ static void arc_write(void *opaque, hwaddr addr, uint64_t val,
     trig_cnt &= 1;
     if(!trig_cnt)
         return;
-        
+
     TenstorrentState *tt = opaque;
     proc_arc_msg(tt);
 }
@@ -1230,21 +1435,61 @@ static void tenstorrent_exit(PCIDevice *dev)
     }
 }
 
+static const char *core_type_name[] = {"B", "N", "T0", "T1", "T2"};
+
+void dump_tensix_node(TenstorrentState *tt, int x, int y) {
+    if (get_node_type(x, y) != TENSIX) {
+        printf("(%d,%d) is not a tensix node\n", x, y);
+        return;
+    }
+    TensixNodeState *node = &tt->node_core[y][x].tensix;
+    printf("=== Tensix (%d,%d) ===\n", x, y);
+    for (int i = 0; i < NUM_CORES; i++) {
+        Rv32Core *core = &node->tensix_cores[i];
+        if (core->rv32cpu) {
+            printf("  %s: pc=0x%x halted=%d\n",
+                   core_type_name[i],
+                   rv32_get_pc(core->rv32cpu),
+                   rv32_has_halted(core->rv32cpu));
+        } else {
+            printf("  %s: not started\n", core_type_name[i]);
+        }
+    }
+}
+
 static void release_resources(TenstorrentState *tt) {
     // Stop all RV32 cores
+    int stopped_tensix = 0, stopped_eth = 0;
     for (int y = 0; y < BH_GRID_Y; ++y) {
         for (int x = 0; x < BH_GRID_X; ++x) {
             if (get_node_type(x, y) == ETH) {
-                stop_aeth_node(&tt->node_core[y][x].aeth_core);
+                EthNodeState *eth = &tt->node_core[y][x].eth;
+                if (eth->cores[ETH_DM0].rv32cpu || eth->cores[ETH_DM1].rv32cpu) {
+                    stop_eth_node(eth);
+                    stopped_eth++;
+                }
             } else if (get_node_type(x, y) == TENSIX) {
-                stop_tensix_node(tt->node_core[y][x].tensix.tensix_cores);
+                Rv32Core *cores = tt->node_core[y][x].tensix.tensix_cores;
+                if (cores[B_CORE].rv32cpu) {
+                    stop_tensix_node(x, y, cores);
+                    stopped_tensix++;
+                }
             }
         }
     }
-    
-    // Wait for coroutines to stop
-    usleep(50000); // 50ms
-    
+    if (stopped_tensix || stopped_eth)
+        TT_LOG(LOG_LEVEL_INFO, "release_resources: stopped %d tensix nodes, %d eth nodes\n",
+               stopped_tensix, stopped_eth);
+
+    // Stop and recreate scheduler so threads don't spin idle
+    if (tt->scheduler) {
+        scheduler_stop(tt->scheduler);
+        scheduler_destroy(tt->scheduler);
+        tt->scheduler = scheduler_create(NUM_SCHEDULER_THREADS);
+        scheduler_start(tt->scheduler);
+        tt->total_coroutines = 0;
+    }
+
     for (int i = 0; i < TLB_2M_WINDOW_COUNT; ++i) {
         MemoryRegion *mr = &tt->tlb_2m_region[i];
         if (memory_region_is_mapped(mr))

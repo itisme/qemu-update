@@ -3,7 +3,7 @@
 
 ////////////////////////////////////////////////////////////////////////
 ///arc telemetry part
-#define TELEMETRY_NUM 13
+#define TELEMETRY_NUM 21
 
 typedef enum {
     BOARD_ID_HIGH = 1,
@@ -44,9 +44,16 @@ typedef enum {
     ENABLED_GDDR = 36,
     ENABLED_L2CPU = 37,
     PCIE_USAGE = 38,
-    NUMBER_OF_TAGS = 39,
+    NOC_TRANSLATION = 40,
+    FAN_RPM = 41,
     ASIC_LOCATION = 52,
+    TDC_LIMIT_MAX = 55,
+    TT_FLASH_VERSION = 58,
+    ASIC_ID_HIGH = 61,
+    ASIC_ID_LOW = 62,
     AICLK_LIMIT_MAX = 63,
+    TDP_LIMIT_MAX = 64,
+    NUMBER_OF_TAGS = 65,
 } TelemetryTag;
 
 //////////////////////////////////////////////////////////////////////////////////////////////////
@@ -218,7 +225,7 @@ typedef struct boot_results_t {
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 /// dev_mem_map
 #define MEM_ERISC_RESERVED1 0
-#define MEM_ERISC_RESERVED1_SIZE 1024
+#define MEM_ERISC_RESERVED1_SIZE 256
 
 #define MAX_NUM_NOCS_PER_CORE 2
 #define MAX_RISCV_PER_CORE    5
@@ -258,7 +265,7 @@ struct kernel_config_msg_t {
     volatile uint8_t mode;  // dispatch mode host/dev
     volatile uint8_t pad2[1];  // CODEGEN:skip
     volatile uint32_t kernel_text_offset[NUM_PROCESSORS_PER_CORE_TYPE];
-    volatile uint32_t local_cb_mask;
+    volatile uint64_t local_cb_mask;
 
     volatile uint8_t brisc_noc_id;
     volatile uint8_t brisc_noc_mode;
@@ -276,7 +283,7 @@ struct kernel_config_msg_t {
 
     volatile uint8_t sub_device_origin_x;  // Logical X coordinate of the sub device origin
     volatile uint8_t sub_device_origin_y;  // Logical Y coordinate of the sub device origin
-    volatile uint8_t pad3[1];              // CODEGEN:skip
+    volatile uint8_t pad3[13];             // CODEGEN:skip
 
     volatile uint8_t preload;  // Must be at end, so it's only written when all other data is written.
 } __attribute__((packed));
@@ -497,20 +504,20 @@ typedef struct mailboxes_t {
 #define RUN_SYNC_MSG_ALL_SUBORDINATES_DONE  0
 
 // formware base address
-#define MEM_NCRISC_FIRMWARE_SIZE 1536
-#define MEM_TRISC0_FIRMWARE_SIZE 1536
-#define MEM_TRISC1_FIRMWARE_SIZE 1536
-#define MEM_TRISC2_FIRMWARE_SIZE 1536
+#define MEM_NCRISC_FIRMWARE_SIZE 2560
+#define MEM_TRISC0_FIRMWARE_SIZE 2560
+#define MEM_TRISC1_FIRMWARE_SIZE 2560
+#define MEM_TRISC2_FIRMWARE_SIZE 2560
 
 #define MEM_MAILBOX_BASE 96
-#define MEM_MAILBOX_SIZE 12768
+#define MEM_MAILBOX_SIZE 12896
 #define MEM_MAILBOX_END (MEM_MAILBOX_BASE + MEM_MAILBOX_SIZE)
 
 #define MEM_ZEROS_BASE ((MEM_MAILBOX_END + 31) & ~31)
 #define MEM_ZEROS_SIZE 512
 #define MEM_LLK_DEBUG_SIZE 1024
 #define MEM_LLK_DEBUG_BASE (MEM_ZEROS_BASE + MEM_ZEROS_SIZE)
-#define MEM_BRISC_FIRMWARE_SIZE (6 * 1024 + 1024)
+#define MEM_BRISC_FIRMWARE_SIZE (6 * 1024 + 2560)
 
 #define MEM_BRISC_FIRMWARE_BASE (MEM_LLK_DEBUG_BASE + MEM_LLK_DEBUG_SIZE)
 #define MEM_NCRISC_FIRMWARE_BASE (MEM_BRISC_FIRMWARE_BASE + MEM_BRISC_FIRMWARE_SIZE)
@@ -519,12 +526,17 @@ typedef struct mailboxes_t {
 #define MEM_TRISC2_FIRMWARE_BASE (MEM_TRISC1_FIRMWARE_BASE + MEM_TRISC1_FIRMWARE_SIZE)
 
 #define MEM_ERISC_RESERVED1 0
-#define MEM_ERISC_RESERVED1_SIZE 1024
+#define MEM_ERISC_RESERVED1_SIZE 256
 #define MEM_ERISC_MAILBOX_SIZE 12768
 #define MEM_AERISC_MAILBOX_BASE (MEM_ERISC_RESERVED1 + MEM_ERISC_RESERVED1_SIZE)
 #define MEM_AERISC_MAILBOX_SIZE MEM_ERISC_MAILBOX_SIZE
 #define MEM_AERISC_MAILBOX_END (MEM_AERISC_MAILBOX_BASE + MEM_AERISC_MAILBOX_SIZE)
-#define MEM_AERISC_FIRMWARE_BASE MEM_AERISC_MAILBOX_END
+#define MEM_L1_INLINE_SIZE_PER_NOC 16
+#define MEM_AERISC_L1_INLINE_BASE MEM_AERISC_MAILBOX_END
+#define MEM_AERISC_L1_INLINE_END (MEM_AERISC_L1_INLINE_BASE + (MEM_L1_INLINE_SIZE_PER_NOC * 2) * 2)
+#define MEM_AERISC_VOID_LAUNCH_FLAG MEM_AERISC_L1_INLINE_END
+#define MEM_AERISC_VOID_LAUNCH_FLAG_SIZE 16
+#define MEM_AERISC_FIRMWARE_BASE (MEM_AERISC_VOID_LAUNCH_FLAG + MEM_AERISC_VOID_LAUNCH_FLAG_SIZE)
 
 // noc parameter ---------------------------------------------
 #define NOC_REG_SPACE_START_ADDR 0xFF000000
@@ -631,6 +643,15 @@ typedef struct mailboxes_t {
 #define NPST_WRITES_NUM_ACKED   (MEM_LOCAL_BASE + 0x28)
 #define PST_WRITES_NUM_ISSUED   (MEM_LOCAL_BASE + 0x18)
 #define NPST_ATOMICS_ACKED      (MEM_LOCAL_BASE + 0x20)
+
+// Idle ERISC reset PC registers (ram offsets, written by host and firmware)
+#define IERISC_RESET_PC             0x14000
+#define SUBORDINATE_IERISC_RESET_PC 0x14008
+
+// Wall clock timer registers (offset from RISCV_DEBUG_REGS_START_ADDR 0xFFB12000)
+// Firmware reads these via riscv_wait() for timing delays
+#define WALL_CLOCK_L    0x121F0   // low 32-bit, relative to 0xFFB00000
+#define WALL_CLOCK_H    0x121F8   // high 32-bit, relative to 0xFFB00000
 
 #define PREFETCH_Q_BASE  0x18fc0
 
