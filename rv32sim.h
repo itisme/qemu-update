@@ -32,6 +32,9 @@ void rv32_halt(rv32_cpu_t handle);
 
 int rv32_has_halted(rv32_cpu_t handle);
 
+// Get current PC
+uint32_t rv32_get_pc(rv32_cpu_t handle);
+
 // Destroy the CPU instance
 void rv32_destroy(rv32_cpu_t handle);
 
@@ -48,7 +51,8 @@ void tensix_init(tensix_t *tt,
                  uint8_t *high_mem,
                  uint8_t *t0_ldm,
                  uint8_t *t1_ldm,
-                 uint8_t *t2_ldm);
+                 uint8_t *t2_ldm,
+                 uint16_t noc_xy);
 
 #ifdef __cplusplus
 }

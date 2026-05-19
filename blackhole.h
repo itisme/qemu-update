@@ -393,7 +393,6 @@ struct DebugPrintMemLayout {
 
 struct dprint_buf_msg_t {
     struct DebugPrintMemLayout data[NUM_PROCESSORS_PER_CORE_TYPE];
-    uint32_t pad;  // to 1024 bytes
 };
 
 struct addressable_core_t {
@@ -422,6 +421,7 @@ struct core_info_msg_t {
     volatile uint8_t absolute_logical_x;  // Logical X coordinate of this core
     volatile uint8_t absolute_logical_y;  // Logical Y coordinate of this core
     volatile uint32_t l1_unreserved_start;
+    volatile uint32_t core_magic_number;
     uint8_t pad;  // CODEGEN:skip
 };
 
@@ -445,14 +445,14 @@ typedef struct mailboxes_t {
                                           // dispatch init moves to one-shot.
     struct launch_msg_t launch[launch_msg_buffer_num_entries];
     volatile struct go_msg_t go_messages[go_message_num_entries];
-    uint32_t pads_1[3];                  // CODEGEN:skip
-    volatile uint32_t go_message_index;  // Index into go_messages to use. Always 0 on unicast cores.
+    uint64_t link_status_check_timestamp;  // Next timestamp to check link status (active erisc)
+    volatile uint32_t go_message_index;    // Index into go_messages to use. Always 0 on unicast cores.
     struct watcher_msg_t watcher;
     struct dprint_buf_msg_t dprint_buf;  // CODEGEN:skip
     struct core_info_msg_t core_info;
+    uint32_t aerisc_run_flag;  // 1: run active ethernet firmware, 0: return to base firmware (active erisc)
     // Keep profiler last since it's size is dynamic per core type
-    uint32_t pads_2[PROFILER_NOC_ALIGNMENT_PAD_COUNT];  // CODEGEN:skip
-    struct profiler_msg_t profiler;                            // CODEGEN:skip
+    struct profiler_msg_t profiler __attribute__((aligned(16)));  // CODEGEN:skip
 } mailboxes_t;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -586,6 +586,8 @@ typedef struct mailboxes_t {
 //
 #define NOC_CTRL_STATUS_READY 0x0
 #define NOC_CMD_RESP_MARKED (0x1 << 4)
+#define NOC_CMD_BRCST_PACKET (0x1 << 5)
+#define NOC_CMD_BRCST_SRC_INCLUDE (0x1 << 17)
 // Atomic command codes
 #define NOC_AT_INS_NOP 0x0
 #define NOC_AT_INS_INCR_GET 0x1

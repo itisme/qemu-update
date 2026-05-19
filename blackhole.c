@@ -133,7 +133,7 @@ void virt2log(int *x, int *y) {
 NodeType get_node_type(int x, int y) {
     if(x == 8 && y == 0)
         return ARC;
-    else if(x == 0 || x == 9)
+    else if(x == 0 || x == 8 || x == 9)
         return DRAM;
     else if(y == 1)
         return ETH;

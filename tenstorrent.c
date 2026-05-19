@@ -28,7 +28,7 @@
 #define LOG_LEVEL_DEBUG   3
 
 #ifndef TT_LOG_LEVEL
-#define TT_LOG_LEVEL LOG_LEVEL_INFO
+#define TT_LOG_LEVEL LOG_LEVEL_VERBOSE
 #endif
 
 #define TT_LOG(level, fmt, ...) do { \
@@ -87,7 +87,8 @@ static bool is_arcnode(int x, int y) {
 // RAM mapping size: 1MB for L1 storage, upper 1MB for MMIO
 #define TLB_RAM_SIZE (1024 * 1024)
 
-static void remap_ram_region(TenstorrentState *tt, int tlb_index, uint8_t *ram, bool isarc){
+static void remap_ram_region(TenstorrentState *tt, int tlb_index, uint8_t *ram,
+                             uint32_t ram_size, bool isarc){
     MemoryRegion *mr = &tt->tlb_2m_region[tlb_index];
 
     if(memory_region_is_mapped(mr)){
@@ -102,8 +103,7 @@ static void remap_ram_region(TenstorrentState *tt, int tlb_index, uint8_t *ram, 
 
     char name[20];
     snprintf(name, sizeof(name), "tlb_mr_%d", tlb_index);
-    // Only map first 1MB as RAM, upper 1MB is MMIO (handled by tenstorrent_tlb_2m_write)
-    memory_region_init_ram_ptr(mr, OBJECT(tt), name, TLB_RAM_SIZE, ram);
+    memory_region_init_ram_ptr(mr, OBJECT(tt), name, ram_size, ram);
     if(isarc)
         memory_region_add_subregion(mr, ARC_FW_INT_ADDR, &tt->arc_mmio);
     memory_region_add_subregion(&tt->bar0_mmio, tlb_index * TLB_2M_WINDOW_SIZE, mr);
@@ -143,7 +143,28 @@ static void tenstorrent_update_node_id(TenstorrentState *tt, int tlb_index)
     int config_index = is_4g_window ? (tlb_index - TLB_2M_WINDOW_COUNT) : tlb_index;
 
     if (is_4g_window) {
-        // 4G window handling (if needed)
+        TLB_4G_REG *config = &tt->tlb_4g_configs[config_index];
+        int x = config->x_end, y = config->y_end;
+        virt2log(&x, &y);
+
+        if (get_node_type(x, y) == DRAM) {
+            uint8_t *ram = obtain_node_mem(tt, x, y);
+            MemoryRegion *mr = &tt->tlb_4g_region[config_index];
+
+            if (memory_region_is_mapped(mr)) {
+                RAMBlock *rb = mr->ram_block;
+                if (rb->host == ram)
+                    return;
+                memory_region_del_subregion(&tt->bar4_mmio, mr);
+            }
+
+            char name[20];
+            snprintf(name, sizeof(name), "tlb4g_mr_%d", config_index);
+            memory_region_init_ram_ptr(mr, OBJECT(tt), name,
+                                       DRAM_BANK_SIZE, ram);
+            memory_region_add_subregion(&tt->bar4_mmio,
+                                        (uint64_t)config_index * TLB_4G_WINDOW_SIZE, mr);
+        }
     } else {
         TLB_2M_REG *config = &tt->tlb_2m_configs[config_index];
         int x = config->x_end, y = config->y_end;
@@ -171,7 +192,16 @@ static void tenstorrent_update_node_id(TenstorrentState *tt, int tlb_index)
         }
 
         uint8_t *ram = obtain_node_mem(tt, x, y);
-        remap_ram_region(tt, tlb_index, ram, is_arcnode(x, y));
+        if (get_node_type(x, y) == DRAM) {
+            // DRAM: map full 2MB window as RAM (no MMIO in DRAM nodes)
+            // Apply TLB address offset into DRAM bank
+            uint64_t dram_offset = (uint64_t)config->address << TLB_2M_SHIFT;
+            remap_ram_region(tt, tlb_index, ram + dram_offset,
+                             TLB_2M_WINDOW_SIZE, false);
+        } else {
+            // TENSIX/ETH/ARC: map 1MB RAM, upper 1MB for MMIO
+            remap_ram_region(tt, tlb_index, ram, TLB_RAM_SIZE, is_arcnode(x, y));
+        }
     }
 }
 
@@ -595,36 +625,82 @@ static void data_write(TenstorrentState *tt, Rv32Core *rv32core, int noc, int cm
     
     off = NOC_CMD_BUF_OFF(noc, cmd_buf, NOC_RET_ADDR_HI);
     uint32_t dst_hi = *(uint32_t *)&hi_mem[off];
-    int x = dst_hi & 0x3f, y = (dst_hi >> 6) & 0x3f;
-    if (x >= BH_GRID_X || y >= BH_GRID_Y)
-    	virt2log(&x, &y);
-    if (get_node_type(x, y) != PCI) {
-        tt->node_mem_8m[y][x] = obtain_node_mem(tt, x, y);
-        memcpy(tt->node_mem_8m[y][x] + dst_lo, &lo_mem[src_addr], size);
-    } else {
-        uint8_t *iatu_config = tt->bar2_regs;
-        AddressSpace *dev_as = pci_get_address_space(&tt->parent_obj);
-        uint64_t host_addr = *(uint32_t *)&iatu_config[ATU_OFFSET_IN_BH_BAR2 + ATU_REGION_ADDR_OFF] + dst_lo;
-        address_space_write(dev_as, host_addr, MEMTXATTRS_UNSPECIFIED, &lo_mem[src_addr], size);
-    }
-    
+
     uint32_t noc_ctrl_off = NOC_CMD_BUF_OFF(noc, cmd_buf, NOC_CTRL);
     uint32_t noc_ctrl = *(uint32_t *)&hi_mem[noc_ctrl_off];
 
-    uint32_t ctrl_off = NOC_CMD_BUF_OFF(noc, cmd_buf, NOC_CMD_CTRL);
-    *(uint32_t *)&hi_mem[ctrl_off] = 0;
+    if (noc_ctrl & NOC_CMD_BRCST_PACKET) {
+        // Multicast write: dst_hi encodes a rectangle
+        int x_end   =  dst_hi & 0x3f;
+        int y_end   = (dst_hi >> 6) & 0x3f;
+        int x_start = (dst_hi >> 12) & 0x3f;
+        int y_start = (dst_hi >> 18) & 0x3f;
+        if (x_start >= BH_GRID_X || y_start >= BH_GRID_Y)
+            virt2log(&x_start, &y_start);
+        if (x_end >= BH_GRID_X || y_end >= BH_GRID_Y)
+            virt2log(&x_end, &y_end);
 
-    // Update status registers based on write type
-    if (noc_ctrl & NOC_CMD_RESP_MARKED) {
-        // Nonposted write (requires response)
-        uint32_t req_off = NOC_CMD_BUF_OFF(noc, 0, NOC_STATUS(NIU_MST_NONPOSTED_WR_REQ_SENT));
-        (*(uint32_t *)&hi_mem[req_off])++;
-        uint32_t ack_off = NOC_CMD_BUF_OFF(noc, 0, NOC_STATUS(NIU_MST_WR_ACK_RECEIVED));
-        (*(uint32_t *)&hi_mem[ack_off])++;
+        // NOC 1 routes in reverse direction, so start > end; normalize
+        if (x_start > x_end) { int tmp = x_start; x_start = x_end; x_end = tmp; }
+        if (y_start > y_end) { int tmp = y_start; y_start = y_end; y_end = tmp; }
+
+        bool src_include = (noc_ctrl & NOC_CMD_BRCST_SRC_INCLUDE) != 0;
+        int num_dests = 0;
+
+        for (int y = y_start; y <= y_end; y++) {
+            for (int x = x_start; x <= x_end; x++) {
+                if (!src_include && x == rv32core->node_x && y == rv32core->node_y)
+                    continue;  // skip source node unless src_include
+                if (get_node_type(x, y) != TENSIX && get_node_type(x, y) != ETH)
+                    continue;  // skip non-worker nodes (DRAM, router, etc.)
+                tt->node_mem_8m[y][x] = obtain_node_mem(tt, x, y);
+                memcpy(tt->node_mem_8m[y][x] + dst_lo, &lo_mem[src_addr], size);
+                num_dests++;
+            }
+        }
+
+        TT_LOG(LOG_LEVEL_VERBOSE, "oper (%d, %d), noc %d, MCAST write, (%d,%d)-(%d,%d), dst_lo 0x%x, size %d, num_dests %d\n",
+            rv32core->node_x, rv32core->node_y, noc, x_start, y_start, x_end, y_end, dst_lo, size, num_dests);
+
+        uint32_t ctrl_off = NOC_CMD_BUF_OFF(noc, cmd_buf, NOC_CMD_CTRL);
+        *(uint32_t *)&hi_mem[ctrl_off] = 0;
+
+        if (noc_ctrl & NOC_CMD_RESP_MARKED) {
+            uint32_t req_off = NOC_CMD_BUF_OFF(noc, 0, NOC_STATUS(NIU_MST_NONPOSTED_WR_REQ_SENT));
+            (*(uint32_t *)&hi_mem[req_off])++;
+            uint32_t ack_off = NOC_CMD_BUF_OFF(noc, 0, NOC_STATUS(NIU_MST_WR_ACK_RECEIVED));
+            (*(uint32_t *)&hi_mem[ack_off]) += num_dests;
+        } else {
+            uint32_t req_off = NOC_CMD_BUF_OFF(noc, 0, NOC_STATUS(NIU_MST_POSTED_WR_REQ_SENT));
+            (*(uint32_t *)&hi_mem[req_off])++;
+        }
     } else {
-        // Posted write (no response required)
-        uint32_t req_off = NOC_CMD_BUF_OFF(noc, 0, NOC_STATUS(NIU_MST_POSTED_WR_REQ_SENT));
-        (*(uint32_t *)&hi_mem[req_off])++;
+        // Unicast write
+        int x = dst_hi & 0x3f, y = (dst_hi >> 6) & 0x3f;
+        if (x >= BH_GRID_X || y >= BH_GRID_Y)
+            virt2log(&x, &y);
+        if (get_node_type(x, y) != PCI) {
+            tt->node_mem_8m[y][x] = obtain_node_mem(tt, x, y);
+            memcpy(tt->node_mem_8m[y][x] + dst_lo, &lo_mem[src_addr], size);
+        } else {
+            uint8_t *iatu_config = tt->bar2_regs;
+            AddressSpace *dev_as = pci_get_address_space(&tt->parent_obj);
+            uint64_t host_addr = *(uint32_t *)&iatu_config[ATU_OFFSET_IN_BH_BAR2 + ATU_REGION_ADDR_OFF] + dst_lo;
+            address_space_write(dev_as, host_addr, MEMTXATTRS_UNSPECIFIED, &lo_mem[src_addr], size);
+        }
+
+        uint32_t ctrl_off = NOC_CMD_BUF_OFF(noc, cmd_buf, NOC_CMD_CTRL);
+        *(uint32_t *)&hi_mem[ctrl_off] = 0;
+
+        if (noc_ctrl & NOC_CMD_RESP_MARKED) {
+            uint32_t req_off = NOC_CMD_BUF_OFF(noc, 0, NOC_STATUS(NIU_MST_NONPOSTED_WR_REQ_SENT));
+            (*(uint32_t *)&hi_mem[req_off])++;
+            uint32_t ack_off = NOC_CMD_BUF_OFF(noc, 0, NOC_STATUS(NIU_MST_WR_ACK_RECEIVED));
+            (*(uint32_t *)&hi_mem[ack_off])++;
+        } else {
+            uint32_t req_off = NOC_CMD_BUF_OFF(noc, 0, NOC_STATUS(NIU_MST_POSTED_WR_REQ_SENT));
+            (*(uint32_t *)&hi_mem[req_off])++;
+        }
     }
     
     uint32_t num_acked = NPST_WRITES_NUM_ACKED - MEM_LOCAL_BASE;
@@ -661,14 +737,14 @@ static void atom_write(TenstorrentState *tt, Rv32Core *rv32core, int noc, int cm
     uint8_t * ds_himem = dsmem + TLB_2M_WINDOW_SIZE;
     uint8_t * sem_p = src_addr < MEM_LOCAL_BASE ? (dsmem + src_addr) : (ds_himem  + src_addr - MEM_LOCAL_BASE);
 
-    *(volatile uint32_t *)sem_p += at_data;
-    
+    __atomic_fetch_add((uint32_t *)sem_p, at_data, __ATOMIC_SEQ_CST);
+
     if(src_addr >= NOC_OVERLAY_START_ADDR && src_addr < NOC_OVERLAY_START_ADDR + NOC_NUM_STREAMS * NOC_STREAM_REG_SPACE_SIZE) {
     	int stream_id = (src_addr - NOC_OVERLAY_START_ADDR) / NOC_STREAM_REG_SPACE_SIZE;
     	int reg_id = (src_addr % NOC_STREAM_REG_SPACE_SIZE) / 4;
     	if(reg_id == STREAM_REMOTE_DEST_BUF_SPACE_AVAILABLE_UPDATE_REG_INDEX){
     	    uint32_t hioff = STREAM_REG_ADDR(stream_id, STREAM_REMOTE_DEST_BUF_SPACE_AVAILABLE_REG_INDEX) - MEM_LOCAL_BASE;
-    	    *(volatile uint32_t *)(ds_himem + hioff) += at_data;
+    	    __atomic_fetch_add((uint32_t *)(ds_himem + hioff), at_data, __ATOMIC_SEQ_CST);
     	}
     }
     
@@ -782,7 +858,8 @@ static void start_tensix_node(TenstorrentState *tt, int x, int y, Rv32Core * ten
     tensix_init(tensix_ptr, l1_scratchpad, high_mem,
                 tensix_cores[T0_CORE].ldm,
                 tensix_cores[T1_CORE].ldm,
-                tensix_cores[T2_CORE].ldm);
+                tensix_cores[T2_CORE].ldm,
+                (uint16_t)((y << 6) | x));
 
     queue_handle_t assigned_queue = NULL;
 
