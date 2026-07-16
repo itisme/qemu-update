@@ -174,7 +174,7 @@ typedef enum {
 } CoreType;
 
 // Coroutine scheduler settings
-#define NUM_SCHEDULER_THREADS 10
+#define NUM_SCHEDULER_THREADS 8
 #define INSTRUCTIONS_PER_STEP 100
 #define STEPS_PER_YIELD       1
 
@@ -292,6 +292,14 @@ struct TenstorrentState {
     bool msi_enabled;
     bool msix_enabled;
 
+    // Dedup filter for BAR0 writes (KVM MMIO re-execution guard)
+    hwaddr bar0_last_addr;
+    uint64_t bar0_last_val;
+    unsigned bar0_last_size;
+
+    // ARC write trigger counter (proc_arc_msg fires on every other write)
+    int arc_trig_cnt;
+
     // TLB configuration storage
     TLB_2M_REG tlb_2m_configs[TLB_2M_WINDOW_COUNT];
     TLB_4G_REG tlb_4g_configs[TLB_4G_WINDOW_COUNT];
@@ -307,10 +315,9 @@ struct TenstorrentState {
 
     NodeProcessor node_core[BH_GRID_Y][BH_GRID_X];
 
-    // Multicast tracking per TLB: flush source RAM to all targets on config change
     struct {
         bool active;
-        int xs, ys, xe, ye;  // logical start/end coords of multicast rectangle
+        int xs, ys, xe, ye;
     } mcast_state[TLB_2M_WINDOW_COUNT];
 
     // Coroutine scheduler

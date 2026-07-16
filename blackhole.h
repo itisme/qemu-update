@@ -580,6 +580,11 @@ typedef struct mailboxes_t {
 #define NOC_NODE_ID (NOC_REGS_START_ADDR + 0x44)
 #define NOC_ENDPOINT_ID (NOC_REGS_START_ADDR + 0x48)
 
+/* NOC configuration registers: NOC_CFG[n] = NOC_REGS_START_ADDR + 0x100 + n*4 */
+#define NOC_CFG_BASE    (NOC_REGS_START_ADDR + 0x100)
+#define NOC_ID_LOGICAL  18   /* logical XY coordinate: (y<<6)|x */
+#define NOC_CFG(reg)    (NOC_CFG_BASE + (reg) * 4)
+
 //
 // NOC CTRL fields
 #define NOC_CTRL_SEND_REQ (0x1 << 0)

@@ -31,8 +31,14 @@
 #define TT_LOG_LEVEL LOG_LEVEL_VERBOSE
 #endif
 
+/* Runtime status (INFO/VERBOSE/DEBUG) goes to stdout so it shows on the
+ * terminal / trace.log. Only ERROR-level lines go to stderr. Reserve stderr
+ * for actual errors and short-lived debug fprintf(stderr,...) calls that
+ * are removed when no longer needed. */
 #define TT_LOG(level, fmt, ...) do { \
-    if ((level) <= TT_LOG_LEVEL) printf(fmt, ##__VA_ARGS__); \
+    if ((level) <= TT_LOG_LEVEL) { \
+        fprintf((level) <= LOG_LEVEL_ERROR ? stderr : stdout, fmt, ##__VA_ARGS__); \
+    } \
 } while (0)
 
 static void proc_arc_msg(TenstorrentState *tt);
@@ -112,23 +118,56 @@ static void remap_ram_region(TenstorrentState *tt, int tlb_index, uint8_t *ram,
 // Flush multicast: copy source node RAM to all other nodes in the rectangle
 static void flush_mcast(TenstorrentState *tt, int tlb_index)
 {
+    if (!tt->mcast_state[tlb_index].active) return;
     int xs = tt->mcast_state[tlb_index].xs;
     int ys = tt->mcast_state[tlb_index].ys;
     int xe = tt->mcast_state[tlb_index].xe;
     int ye = tt->mcast_state[tlb_index].ye;
     uint8_t *src = obtain_node_mem(tt, xe, ye);
 
-    TT_LOG(LOG_LEVEL_INFO, "flush_mcast tlb=%d (%d,%d)-(%d,%d)\n", tlb_index, xs, ys, xe, ye);
+    TT_LOG(LOG_LEVEL_INFO, "flush_mcast tlb=%d (%d,%d)-(%d,%d)\n",
+           tlb_index, xs, ys, xe, ye);
+
+    if (!src) {
+        tt->mcast_state[tlb_index].active = false;
+        return;
+    }
+
+    /* Copy [0, COPY_END) for all workers, skipping the 8 launch_msg.mode bytes
+     * at 154+n*112 (n=0..7) to prevent mode=HOST propagation deadlock. */
+    const uint32_t COPY_END = TLB_RAM_SIZE;
+    uint32_t starts[10], ends[10];
+    int nseg = 0;
+    {
+        uint32_t cur = 0;
+        for (int n = 0; n < 8; n++) {
+            uint32_t mode_off = 154 + n * 112;
+            if (mode_off >= COPY_END) break;
+            if (mode_off > cur) {
+                starts[nseg] = cur;
+                ends[nseg]   = mode_off;
+                nseg++;
+            }
+            cur = mode_off + 1;
+        }
+        if (cur < COPY_END) {
+            starts[nseg] = cur;
+            ends[nseg]   = COPY_END;
+            nseg++;
+        }
+    }
 
     for (int y = ys; y <= ye; y++) {
         for (int x = xs; x <= xe; x++) {
-            if (x == xe && y == ye)
-                continue;  // skip source node
+            if (x == xe && y == ye) continue;
+            if (get_node_type(x, y) == DRAM) continue;
             uint8_t *dst = obtain_node_mem(tt, x, y);
-            if (dst && dst != src)
-                memcpy(dst, src, TLB_2M_WINDOW_SIZE);
+            if (!dst || dst == src) continue;
+            for (int s = 0; s < nseg; s++)
+                memcpy(dst + starts[s], src + starts[s], ends[s] - starts[s]);
         }
     }
+
     tt->mcast_state[tlb_index].active = false;
 }
 
@@ -173,10 +212,10 @@ static void tenstorrent_update_node_id(TenstorrentState *tt, int tlb_index)
         if (config->multicast) {
             int xs = config->x_start, ys = config->y_start;
             virt2log(&xs, &ys);
-            // If previous multicast on this TLB had different target, flush first
-            if (tt->mcast_state[tlb_index].active &&
-                (tt->mcast_state[tlb_index].xs != xs || tt->mcast_state[tlb_index].ys != ys ||
-                 tt->mcast_state[tlb_index].xe != x  || tt->mcast_state[tlb_index].ye != y)) {
+            /* New (or re-configured) mcast session: flush any pending session
+             * first, then (under snap+diff) snapshot the new source so future
+             * flush only propagates this session's writes. */
+            if (tt->mcast_state[tlb_index].active) {
                 flush_mcast(tt, tlb_index);
             }
             tt->mcast_state[tlb_index].active = true;
@@ -185,7 +224,7 @@ static void tenstorrent_update_node_id(TenstorrentState *tt, int tlb_index)
             tt->mcast_state[tlb_index].xe = x;
             tt->mcast_state[tlb_index].ye = y;
         } else {
-            // Switching from multicast to unicast: flush pending data
+            /* Switching to unicast: flush any pending mcast session. */
             if (tt->mcast_state[tlb_index].active) {
                 flush_mcast(tt, tlb_index);
             }
@@ -349,7 +388,18 @@ static uint64_t tenstorrent_bar4_read(void *opaque, hwaddr addr, unsigned size)
 static void tenstorrent_bar4_write(void *opaque, hwaddr addr, uint64_t val,
                                   unsigned size)
 {
-    // 4G TLB window is typically read-only
+    TenstorrentState *tt = (TenstorrentState *)opaque;
+    int tlb_index = addr / TLB_4G_WINDOW_SIZE;
+    if (tlb_index < 0 || tlb_index >= TLB_4G_WINDOW_COUNT) return;
+    int global_tlb_index = TLB_2M_WINDOW_COUNT + tlb_index;
+    if (!tt->tlb_configured[global_tlb_index]) return;
+    TLB_4G_REG *config = &tt->tlb_4g_configs[tlb_index];
+    int x = config->x_end, y = config->y_end;
+    virt2log(&x, &y);
+    if (get_node_type(x, y) != DRAM) return;
+    uint8_t *buf = obtain_node_mem(tt, x, y);
+    uint64_t offset = addr & TLB_4G_WINDOW_MASK;
+    memcpy(buf + offset, &val, size);
 }
 
 static const MemoryRegionOps tenstorrent_bar4_ops = {
@@ -560,7 +610,9 @@ static void rv32_core_coroutine(void* tt_ptr, void* core_ptr) {
 #define GET_MEM1(offset, lo, hi, ldm, ldm_size) (offset < MEM_LOCAL_BASE ? &lo[offset] : \
 	(offset < ldm_size + MEM_LOCAL_BASE) ? &ldm[offset - MEM_LOCAL_BASE] : &hi[offset - MEM_LOCAL_BASE])
 
-static void data_read(TenstorrentState *tt, Rv32Core *rv32core, int noc, int cmd_buf, 
+
+
+static void data_read(TenstorrentState *tt, Rv32Core *rv32core, int noc, int cmd_buf,
 	uint8_t * iatu_config, uint8_t * lo_mem, uint8_t * hi_mem) {
     int off = NOC_CMD_BUF_OFF(noc, cmd_buf, NOC_TARG_ADDR_LO);
     uint32_t src_addr = *(uint32_t *)&hi_mem[off];
@@ -583,6 +635,7 @@ static void data_read(TenstorrentState *tt, Rv32Core *rv32core, int noc, int cmd
     } else {
     	tt->node_mem_8m[y][x] = obtain_node_mem(tt, x, y);
         memcpy(&lo_mem[dst_addr], tt->node_mem_8m[y][x] + src_addr, size);
+
     }
 
     off = NOC_CMD_BUF_OFF(noc, cmd_buf, NOC_CMD_CTRL);
@@ -744,7 +797,12 @@ static void atom_write(TenstorrentState *tt, Rv32Core *rv32core, int noc, int cm
     	int reg_id = (src_addr % NOC_STREAM_REG_SPACE_SIZE) / 4;
     	if(reg_id == STREAM_REMOTE_DEST_BUF_SPACE_AVAILABLE_UPDATE_REG_INDEX){
     	    uint32_t hioff = STREAM_REG_ADDR(stream_id, STREAM_REMOTE_DEST_BUF_SPACE_AVAILABLE_REG_INDEX) - MEM_LOCAL_BASE;
-    	    __atomic_fetch_add((uint32_t *)(ds_himem + hioff), at_data, __ATOMIC_SEQ_CST);
+    	    uint32_t new_val = __atomic_add_fetch((uint32_t *)(ds_himem + hioff), at_data, __ATOMIC_SEQ_CST);
+    	    /* Per-stream UPDATE atom trace: enabled at LOG_LEVEL_DEBUG.
+    	     * Used to attribute dispatch credits to their source workers. */
+    	    TT_LOG(LOG_LEVEL_DEBUG,
+    	           "[SU_ATOM] src=(%2d,%2d) -> dst=(%2d,%2d) s%d at_data=0x%x new_avail=0x%x\n",
+    	           rv32core->node_x, rv32core->node_y, x, y, stream_id, at_data, new_val);
     	}
     }
     
@@ -855,6 +913,11 @@ static void start_tensix_node(TenstorrentState *tt, int x, int y, Rv32Core * ten
     // Initialize Tensix coprocessor
     // Each baby core has its own private LDM (ldm[] in Rv32Core), high_mem is shared/public
     memset(high_mem, 0, HIGH_MEM_SIZE);
+    // NOC_CFG(NOC_ID_LOGICAL): firmware reads this to init my_x/my_y on each NOC.
+    // On hardware pre-configured; emulator sets it to the node's virtual coords.
+    uint32_t noc_id = ((uint32_t)y << 6) | (uint32_t)x;
+    *(uint32_t *)(high_mem + (NOC_CFG(NOC_ID_LOGICAL) - MEM_LOCAL_BASE))                        = noc_id;
+    *(uint32_t *)(high_mem + (NOC_CFG(NOC_ID_LOGICAL) - MEM_LOCAL_BASE) + NOC_INSTANCE_OFFSET) = noc_id;
     tensix_init(tensix_ptr, l1_scratchpad, high_mem,
                 tensix_cores[T0_CORE].ldm,
                 tensix_cores[T1_CORE].ldm,
@@ -1148,46 +1211,37 @@ static void tenstorrent_tlb_2m_write(TenstorrentState *tt, hwaddr addr, uint64_t
         virt2log(&xs, &ys);
         virt2log(&xe, &ye);
 
-        // For soft_reset (process_control), flush first 1MB from RAM-mapped node
-        // to all other nodes first. The RAM region only covers (x_end, y_end), so
-        // firmware/go_message data written through the RAM path must be propagated
-        // before reset_tensix_node checks signal/fw conditions.
+        // For soft_reset (process_control), flush the mcast session first so
+        // any pending mcast writes (e.g. firmware/launch_msg) are propagated
+        // to all rect nodes before reset_tensix_node checks signal/fw state.
         if (offset >= TLB_RAM_SIZE && tt->mcast_state[tlb_index].active) {
             flush_mcast(tt, tlb_index);
-            tt->mcast_state[tlb_index].active = true;  // keep active after flush
+            /* flush_mcast cleared .active; re-arm for subsequent writes. */
+            tt->mcast_state[tlb_index].active = true;
         }
 
-        int started_tensix = 0, started_eth = 0;
         for (int y = ys; y <= ye; y++) {
             for (int x = xs; x <= xe; x++) {
                 uint8_t *buf = obtain_node_mem(tt, x, y);
                 if (offset >= TLB_RAM_SIZE)
                     process_control(tt, x, y, offset, val, buf);
                 memcpy(&buf[offset], &val, size);
-                // Count started cores for summary
-                if (offset == (TENSIX_SOFT_RESET_ADDR & TLB_2M_WINDOW_MASK)) {
-                    NodeType nt = get_node_type(x, y);
-                    if (nt == TENSIX && tt->node_core[y][x].tensix.tensix_cores[B_CORE].rv32cpu)
-                        started_tensix++;
-                    else if (nt == ETH && tt->node_core[y][x].eth.cores[ETH_DM0].rv32cpu)
-                        started_eth++;
-                }
             }
-        }
-        if (started_tensix || started_eth) {
-            bool is_deassert = (val & 0x800) == 0;
-            char buf[20];
-            TT_LOG(LOG_LEVEL_INFO, "mcast soft_reset (%d,%d)-(%d,%d): %s, started %d tensix + %d eth, val=0x%lx, time %s\n",
-                   xs, ys, xe, ye, is_deassert ? "deassert" : "assert",
-                   started_tensix, started_eth, (unsigned long)val, get_timestamp(buf, sizeof(buf)));
         }
     } else {
         int x = config->x_end & 0x3F;
         int y = config->y_end & 0x3F;
         virt2log(&x, &y);
         uint8_t *buf = obtain_node_mem(tt, x, y);
-        if (offset >= TLB_RAM_SIZE)
+        if (offset >= TLB_RAM_SIZE) {
+            for (int i = 0; i < TLB_2M_WINDOW_COUNT; i++) {
+                if (!tt->mcast_state[i].active) continue;
+                if (x >= tt->mcast_state[i].xs && x <= tt->mcast_state[i].xe &&
+                    y >= tt->mcast_state[i].ys && y <= tt->mcast_state[i].ye)
+                    flush_mcast(tt, i);
+            }
             process_control(tt, x, y, offset, val, buf);
+        }
         memcpy(&buf[offset], &val, size);
     }
 }
@@ -1250,19 +1304,15 @@ static uint64_t tenstorrent_bar0_read(void *opaque, hwaddr addr, unsigned size)
 static void tenstorrent_bar0_write(void *opaque, hwaddr addr, uint64_t val,
                                    unsigned size)
 {
-    static hwaddr last_addr = 0;
-    static uint64_t last_val = 0;
-    static unsigned last_size = 0;
-    
+    TenstorrentState *tt = opaque;
+
     // Skip if same as immediately previous call (KVM MMIO re-execution)
-    if (addr == last_addr && val == last_val && size == last_size) {
+    if (addr == tt->bar0_last_addr && val == tt->bar0_last_val && size == tt->bar0_last_size) {
         return;
     }
-    last_addr = addr;
-    last_val = val;
-    last_size = size;
-    
-    TenstorrentState *tt = opaque;
+    tt->bar0_last_addr = addr;
+    tt->bar0_last_val = val;
+    tt->bar0_last_size = size;
 
     // Handle TLB configuration register writes
     if (addr >= TLB_REGS_START && addr < TLB_REGS_START + TLB_REGS_LEN) {
@@ -1344,13 +1394,12 @@ static uint64_t arc_read(void *opaque, hwaddr addr, unsigned size)
 
 static void arc_write(void *opaque, hwaddr addr, uint64_t val,
                                   unsigned size) {
-    static int trig_cnt;
-    ++trig_cnt;
-    trig_cnt &= 1;
-    if(!trig_cnt)
+    TenstorrentState *tt = opaque;
+    ++tt->arc_trig_cnt;
+    tt->arc_trig_cnt &= 1;
+    if (!tt->arc_trig_cnt)
         return;
 
-    TenstorrentState *tt = opaque;
     proc_arc_msg(tt);
 }
 
@@ -1483,12 +1532,12 @@ static void tenstorrent_realize(PCIDevice *dev, Error **errp)
     tt->scheduler = scheduler_create(NUM_SCHEDULER_THREADS);
     tt->total_coroutines = 0;
     tt->total_instructions = 0;
-    
+
     if (!tt->scheduler) {
         error_setg(errp, "Failed to create coroutine scheduler");
         return;
     }
-    
+
     // Start scheduler
     scheduler_start(tt->scheduler);
  }
@@ -1572,15 +1621,57 @@ static void release_resources(TenstorrentState *tt) {
         if (memory_region_is_mapped(mr))
             memory_region_del_subregion(&tt->bar0_mmio, mr);
     }
+    // Free non-DRAM node memory. DRAM nodes share bank pointers, so skip them
+    // here to avoid double-free; free banks separately below.
     for (int y = 0; y < BH_GRID_Y; ++y) {
         for (int x = 0; x < BH_GRID_X; ++x) {
+            if (get_node_type(x, y) == DRAM) {
+                tt->node_mem_8m[y][x] = NULL;
+                continue;
+            }
             uint8_t *p = tt->node_mem_8m[y][x];
-            if(p) {
+            if (p) {
                 qemu_vfree(p);
                 tt->node_mem_8m[y][x] = NULL;
             }
         }
     }
+    // Free each DRAM bank once and NULL the pointer so the next run gets a
+    // fresh OS-zeroed allocation from obtain_node_mem.
+    for (int b = 0; b < DRAM_BANK_NUM; b++) {
+        if (tt->dram_bank[b]) {
+            qemu_vfree(tt->dram_bank[b]);
+            tt->dram_bank[b] = NULL;
+        }
+    }
+
+    // Remove 4G TLB regions from BAR4 (DRAM banks just freed above).
+    for (int i = 0; i < TLB_4G_WINDOW_COUNT; ++i) {
+        MemoryRegion *mr = &tt->tlb_4g_region[i];
+        if (memory_region_is_mapped(mr))
+            memory_region_del_subregion(&tt->bar4_mmio, mr);
+    }
+
+    // Reset TenstorrentState scalar/array fields to match fresh device state,
+    // identical to tenstorrent_realize.  node_mem_8m and dram_bank are already
+    // NULLed above.
+    memset(tt->bar2_regs,    0, sizeof(tt->bar2_regs));
+    memset(tt->csm_regs,     0, sizeof(tt->csm_regs));
+    uint32_t qb = ARC_CSM_BASE + ARC_MSG_QUEUE_BASE;
+    memcpy(&tt->csm_regs[ARC_MSG_QCB_OFFSET],     &qb,                    4);
+    uint32_t qi = NUM_ENTRIES_PER_QUEUE;
+    memcpy(&tt->csm_regs[ARC_MSG_QCB_OFFSET + 4], &qi,                    4);
+    memset(tt->tlb_2m_configs, 0, sizeof(tt->tlb_2m_configs));
+    memset(tt->tlb_4g_configs, 0, sizeof(tt->tlb_4g_configs));
+    memset(tt->tlb_configured, 0, sizeof(tt->tlb_configured));
+    memset(tt->node_core,      0, sizeof(tt->node_core));
+    memset(tt->mcast_state,    0, sizeof(tt->mcast_state));
+    memset(tt->noc2axi_cfg,    0, sizeof(tt->noc2axi_cfg));
+    tt->status = 0;
+    tt->bar0_last_addr = 0;
+    tt->bar0_last_val  = 0;
+    tt->bar0_last_size = 0;
+    tt->arc_trig_cnt   = 0;
 }
 
 //static Property tenstorrent_properties[] = {
